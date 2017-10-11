@@ -39,6 +39,14 @@ class Importer(val output: java.io.PrintWriter) {
         val sym = owner.getModuleOrCreate(name)
         processMembersDecls(owner, sym, members)
 
+      case ConstDecl(IdentName(name), Some(tpe @ ObjectType(members))) =>
+        val sym = owner.getModuleOrCreate(name)
+        processMembersDecls(owner, sym, members)
+
+      case LetDecl(IdentName(name), Some(tpe @ ObjectType(members))) =>
+        val sym = owner.getModuleOrCreate(name)
+        processMembersDecls(owner, sym, members)
+
       case TypeDecl(TypeNameName(name), tpe @ ObjectType(members)) =>
         val sym = owner.getClassOrCreate(name)
         processMembersDecls(owner, sym, members)
@@ -51,7 +59,7 @@ class Importer(val output: java.io.PrintWriter) {
         // Module
         val sym = owner.getModuleOrCreate(name)
         for (IdentName(name) <- members) {
-          val m = sym.newField(name)
+          val m = sym.newField(name, Set.empty)
           m.protectName()
           m.tpe = TypeRef(tsym.name)
         }
@@ -88,8 +96,21 @@ class Importer(val output: java.io.PrintWriter) {
         sym.tparams ++= typeParamsToScala(tparams)
         processMembersDecls(owner, sym, members)
 
+      case TypeAliasDecl(TypeNameName(name), tparams, alias) =>
+        val sym = owner.newTypeAlias(name)
+        sym.tparams ++= typeParamsToScala(tparams)
+        sym.alias = typeToScala(alias)
+
       case VarDecl(IdentName(name), TypeOrAny(tpe)) =>
-        val sym = owner.newField(name)
+        val sym = owner.newField(name, Set.empty)
+        sym.tpe = typeToScala(tpe)
+
+      case ConstDecl(IdentName(name), TypeOrAny(tpe)) =>
+        val sym = owner.newField(name, Set(Modifier.Const))
+        sym.tpe = typeToScala(tpe)
+
+      case LetDecl(IdentName(name), TypeOrAny(tpe)) =>
+        val sym = owner.newField(name, Set(Modifier.ReadOnly))
         sym.tpe = typeToScala(tpe)
 
       case FunctionDecl(IdentName(name), signature) =>
@@ -125,22 +146,23 @@ class Importer(val output: java.io.PrintWriter) {
         processDefDecl(classSym, Name.CONSTRUCTOR,
             FunSignature(Nil, params, Some(TypeRefTree(CoreType("void")))))
 
-      case PropertyMember(PropertyNameName(name), opt, tpe, true) =>
+      case PropertyMember(PropertyNameName(name), opt, tpe, mods) if mods(Modifier.Static) =>
         assert(owner.isInstanceOf[ClassSymbol],
             s"Cannot process static member $name in module definition")
         val module = enclosing.getModuleOrCreate(owner.name)
-        processPropertyDecl(module, name, tpe)
+        processPropertyDecl(module, name, tpe, mods)
 
-      case PropertyMember(PropertyNameName(name), opt, tpe, _) =>
-        processPropertyDecl(owner, name, tpe)
+      case PropertyMember(PropertyNameName(name), opt, tpe, mods) =>
+        processPropertyDecl(owner, name, tpe, mods)
 
-      case FunctionMember(PropertyName("constructor"), _, signature, false)
-      if owner.isInstanceOf[ClassSymbol] =>
+      case FunctionMember(PropertyName("constructor"), _, signature, modifiers)
+          if owner.isInstanceOf[ClassSymbol] && !modifiers(Modifier.Static) =>
         owner.asInstanceOf[ClassSymbol].isTrait = false
         processDefDecl(owner, Name.CONSTRUCTOR,
             FunSignature(Nil, signature.params, Some(TypeRefTree(CoreType("void")))))
 
-      case FunctionMember(PropertyNameName(name), opt, signature, true) =>
+      case FunctionMember(PropertyNameName(name), opt, signature, modifiers)
+          if modifiers(Modifier.Static) =>
         assert(owner.isInstanceOf[ClassSymbol],
             s"Cannot process static member $name in module definition")
         val module = enclosing.getModuleOrCreate(owner.name)
@@ -170,7 +192,7 @@ class Importer(val output: java.io.PrintWriter) {
   }
 
   private def processPropertyDecl(owner: ContainerSymbol, name: Name,
-      tpe: TypeTree, protectName: Boolean = true) {
+      tpe: TypeTree, modifiers: Modifiers, protectName: Boolean = true) {
     if (name.name != "prototype") {
       tpe match {
         case ObjectType(members) if members.forall(_.isInstanceOf[CallMember]) =>
@@ -178,7 +200,7 @@ class Importer(val output: java.io.PrintWriter) {
           for (CallMember(signature) <- members)
             processDefDecl(owner, name, signature, protectName)
         case _ =>
-          val sym = owner.newField(name)
+          val sym = owner.newField(name, modifiers)
           if (protectName)
             sym.protectName()
           sym.tpe = typeToScala(tpe)
@@ -240,6 +262,13 @@ class Importer(val output: java.io.PrintWriter) {
         }
         TypeRef(baseTypeRef, targs map typeToScala)
 
+      case ConstantType(StringLiteral(_)) =>
+        TypeRef.String
+
+      case ObjectType(List(IndexMember(_, TypeRefTree(CoreType("string"), _), valueType))) =>
+        val valueTpe = typeToScala(valueType)
+        TypeRef(QualifiedName.Dictionary, List(valueTpe))
+
       case ObjectType(members) =>
         // ???
         TypeRef.Any
@@ -264,8 +293,30 @@ class Importer(val output: java.io.PrintWriter) {
           TypeRef(QualifiedName.Function(params.size), targs)
         }
 
+      case UnionType(left, right) =>
+        def visit(tpe: TypeTree, visited: List[TypeRef]): List[TypeRef] = {
+          tpe match {
+            case UnionType(left, right) =>
+              visit(left, visit(right, visited))
+            case _ =>
+              typeToScala(tpe) :: visited
+          }
+        }
+
+        TypeRef.Union(visit(tpe, Nil).distinct)
+
+      case TypeQuery(expr) =>
+        TypeRef.Singleton(QualifiedName((expr.qualifier :+ expr.name).map(
+            ident => Name(ident.name)): _*))
+
+      case TupleType(targs) =>
+          TypeRef(QualifiedName.Tuple(targs.length), targs map typeToScala)
+
       case RepeatedType(underlying) =>
         TypeRef(Name.REPEATED, List(typeToScala(underlying)))
+
+      case PolymorphicThisType =>
+        TypeRef.This
 
       case _ =>
         // ???
@@ -277,13 +328,16 @@ class Importer(val output: java.io.PrintWriter) {
       anyAsDynamic: Boolean = false): TypeRef = {
 
     tpe.name match {
-      case "any"     => if (anyAsDynamic) TypeRef.Dynamic else TypeRef.Any
-      case "dynamic" => TypeRef.Dynamic
-      case "void"    => TypeRef.Unit
-      case "number"  => TypeRef.Double
-      case "bool"    => TypeRef.Boolean
-      case "boolean" => TypeRef.Boolean
-      case "string"  => TypeRef.String
+      case "any"       => if (anyAsDynamic) TypeRef.Dynamic else TypeRef.Any
+      case "dynamic"   => TypeRef.Dynamic
+      case "void"      => TypeRef.Unit
+      case "number"    => TypeRef.Double
+      case "bool"      => TypeRef.Boolean
+      case "boolean"   => TypeRef.Boolean
+      case "string"    => TypeRef.String
+      case "null"      => TypeRef.Null
+      case "undefined" => TypeRef.Unit
+      case "never"     => TypeRef.Nothing
     }
   }
 }

@@ -23,7 +23,7 @@ class TSDefParser extends StdTokenParsers with ImplicitConversions {
 
   lexical.reserved ++= List(
       // Value keywords
-      "true", "false", "null", "undefined",
+      "true", "false",
 
       // Current JavaScript keywords
       "break", "case", "catch", "continue", "debugger", "default", "delete",
@@ -33,18 +33,19 @@ class TSDefParser extends StdTokenParsers with ImplicitConversions {
 
       // Future reserved keywords - some used in TypeScript
       "class", "const", "enum", "export", "extends", "import", "super",
+      "readonly",
 
       // Future reserved keywords in Strict mode - some used in TypeScript
       "implements", "interface", "let", "package", "private", "protected",
       "public", "static", "yield",
 
       // Additional keywords of TypeScript
-      "declare", "module"
+      "declare", "module", "type", "namespace"
   )
 
   lexical.delimiters ++= List(
       "{", "}", "(", ")", "[", "]", "<", ">",
-      ".", ";", ",", "?", ":", "=",
+      ".", ";", ",", "?", ":", "=", "|",
       // TypeScript-specific
       "...", "=>"
   )
@@ -55,16 +56,13 @@ class TSDefParser extends StdTokenParsers with ImplicitConversions {
   lazy val ambientDeclarations: Parser[List[DeclTree]] =
     rep(ambientDeclaration)
 
-  lazy val ambientDeclaration: Parser[DeclTree] =
-    opt("declare") ~> ambientDeclaration1
-
-  lazy val ambientDeclaration1 = (
-      ambientModuleDecl | ambientVarDecl | ambientFunctionDecl
-    | ambientEnumDecl | ambientClassDecl | ambientInterfaceDecl
+  lazy val ambientDeclaration: Parser[DeclTree] = (
+      opt("declare") ~> opt("export") ~> moduleElementDecl1
+    | opt("export") ~> opt("declare") ~> moduleElementDecl1
   )
 
   lazy val ambientModuleDecl: Parser[DeclTree] =
-    "module" ~> rep1sep(propertyName, ".") ~ moduleBody ^^ {
+    ("module" | "namespace") ~> rep1sep(propertyName, ".") ~ moduleBody ^^ {
       case nameParts ~ body =>
         nameParts.init.foldRight(ModuleDecl(nameParts.last, body)) {
           (name, inner) => ModuleDecl(name, inner :: Nil)
@@ -84,10 +82,17 @@ class TSDefParser extends StdTokenParsers with ImplicitConversions {
   lazy val moduleElementDecl1: Parser[DeclTree] = (
       ambientModuleDecl | ambientVarDecl | ambientFunctionDecl
     | ambientEnumDecl | ambientClassDecl | ambientInterfaceDecl
+    | ambientConstDecl | ambientLetDecl | typeAliasDecl
   )
 
   lazy val ambientVarDecl: Parser[DeclTree] =
     "var" ~> identifier ~ optTypeAnnotation <~ opt(";") ^^ VarDecl
+
+  lazy val ambientLetDecl: Parser[DeclTree] =
+    "let" ~> identifier ~ optTypeAnnotation <~ opt(";") ^^ LetDecl
+
+  lazy val ambientConstDecl: Parser[DeclTree] =
+    "const" ~> identifier ~ optTypeAnnotation <~ opt(";") ^^ ConstDecl
 
   lazy val ambientFunctionDecl: Parser[DeclTree] =
     "function" ~> identifier ~ functionSignature <~ opt(";") ^^ FunctionDecl
@@ -103,6 +108,9 @@ class TSDefParser extends StdTokenParsers with ImplicitConversions {
 
   lazy val ambientInterfaceDecl: Parser[DeclTree] =
     "interface" ~> typeName ~ tparams ~ intfInheritance ~ memberBlock <~ opt(";") ^^ InterfaceDecl
+
+  lazy val typeAliasDecl: Parser[DeclTree] =
+    "type" ~> typeName ~ tparams ~ ("=" ~> typeDesc) <~ opt(";") ^^ TypeAliasDecl
 
   lazy val tparams = (
       "<" ~> rep1sep(typeParam, ",") <~ ">"
@@ -169,6 +177,11 @@ class TSDefParser extends StdTokenParsers with ImplicitConversions {
     ":" ~> typeDesc
 
   lazy val typeDesc: Parser[TypeTree] =
+    rep1sep(singleTypeDesc, "|") ^^ {
+      _.reduceLeft(UnionType)
+    }
+
+  lazy val singleTypeDesc: Parser[TypeTree] =
     baseTypeDesc ~ rep("[" ~ "]") ^^ {
       case base ~ arrayDims =>
         (base /: arrayDims) {
@@ -180,6 +193,11 @@ class TSDefParser extends StdTokenParsers with ImplicitConversions {
       typeRef
     | objectType
     | functionType
+    | stringType
+    | typeQuery
+    | tupleType
+    | thisType
+    | "(" ~> typeDesc <~ ")"
   )
 
   lazy val typeRef: Parser[TypeRef] =
@@ -203,11 +221,27 @@ class TSDefParser extends StdTokenParsers with ImplicitConversions {
         FunctionType(FunSignature(tparams, params, Some(resultType)))
     }
 
+  lazy val stringType: Parser[TypeTree] =
+    stringLiteral ^^ ConstantType
+
+  lazy val thisType: Parser[TypeTree] =
+    "this" ^^^ PolymorphicThisType
+
+  lazy val typeQuery: Parser[TypeTree] =
+    "typeof" ~> rep1sep(ident, ".") ^^ { parts =>
+      TypeQuery(QualifiedIdent(parts.init.map(Ident), Ident(parts.last)))
+    }
+
+  lazy val tupleType: Parser[TypeTree] =
+    "[" ~> rep1sep(typeDesc, ",") <~ "]" ^^ { parts =>
+      TupleType(parts)
+    }
+
   lazy val objectType: Parser[TypeTree] =
     memberBlock ^^ ObjectType
 
   lazy val memberBlock: Parser[List[MemberTree]] =
-    "{" ~> rep(typeMember <~ opt(";")) <~ "}"
+    "{" ~> rep(typeMember <~ opt(";" | ",")) <~ "}"
 
   lazy val typeMember: Parser[MemberTree] =
     callMember | constructorMember | indexMember | namedMember
@@ -222,20 +256,22 @@ class TSDefParser extends StdTokenParsers with ImplicitConversions {
     ("[" ~> identifier ~ typeAnnotation <~ "]") ~ typeAnnotation ^^ IndexMember
 
   lazy val namedMember: Parser[MemberTree] =
-    maybeStaticPropName ~ optionalMarker >> {
-      case (name, static) ~ optional => (
-          functionSignature ^^ (FunctionMember(name, optional, _, static))
-        | typeAnnotation ^^ (PropertyMember(name, optional, _, static))
+    modifiers ~ propertyName ~ optionalMarker >> {
+      case mods ~ name ~ optional => (
+          functionSignature ^^ (FunctionMember(name, optional, _, mods))
+        | typeAnnotation ^^ (PropertyMember(name, optional, _, mods))
       )
     }
 
-  lazy val maybeStaticPropName: Parser[(PropertyName, Boolean)] = (
-      "static" ~> propertyName ^^ staticPropName
-    | propertyName ^^ nonStaticPropName
-  )
+  lazy val modifiers: Parser[Modifiers] =
+    rep(modifier).map(_.toSet)
 
-  val staticPropName = (p: PropertyName) => (p, true)
-  val nonStaticPropName = (p: PropertyName) => (p, false)
+  lazy val modifier: Parser[Modifier] = (
+      "static" ^^^ Modifier.Static
+    | "public" ^^^ Modifier.Public
+    | "readonly" ^^^ Modifier.ReadOnly
+    | "protected" ^^^ Modifier.Protected
+  )
 
   lazy val identifier =
     identifierName ^^ Ident
@@ -255,7 +291,7 @@ class TSDefParser extends StdTokenParsers with ImplicitConversions {
     stringLit ^^ StringLiteral
 
   private val isCoreTypeName =
-    Set("any", "void", "number", "bool", "boolean", "string")
+    Set("any", "void", "number", "bool", "boolean", "string", "null", "undefined", "never")
 
   def typeNameToTypeRef(name: String): BaseTypeRef =
     if (isCoreTypeName(name)) CoreType(name)
